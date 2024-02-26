@@ -15,10 +15,10 @@ app = FastAPI()
 logger = logging.getLogger("uvicorn")
 # logger level INFO->DEBUG
 logger.level = logging.DEBUG
+
 images = pathlib.Path(__file__).parent.resolve() / "images"
 items_file = pathlib.Path(__file__).parent.resolve() / "items.json"
 sqlite3_file = pathlib.Path(__file__).parents[1].resolve()/"db"/"mercari.sqlite3"
-# CREATE TABLE items_table(id integer, name string, category string, image_name string)
 
 origins = [os.environ.get("FRONT_URL", "http://localhost:3000")]
 app.add_middleware(
@@ -55,7 +55,7 @@ def add_item(name: str = Form(...),category: str = Form(...),image: UploadFile =
 # アイテム情報をJSONファイルに保存
 def save_items_in_file(name,category,image_name):
     new_item = {"name": name, "category": category, "image_name": image_name}
-    if items_file.exists(items_file):
+    if items_file.exists():
         with open(items_file,'r') as f:
             current_data = json.load(f)
         if new_item in current_data["items"]:
@@ -74,25 +74,27 @@ def save_items_to_sqlite3(name, category, image_name):
     con = sqlite3.connect(sqlite3_file)
     cur = con.cursor()
 
-    cur.execute("SELECT id FROM items_table WHERE name = ?", (category,))
+    cur.execute("SELECT id FROM categories_table WHERE name = ?", (category,))
     category_check = cur.fetchone()
     if not category_check:
-        logger.debug(f"The item's category doesn't exist in the categories yet. ")
+        logger.debug(f"The item's category doesn't exist in the categories_table yet. ")
         try:
-            cur.execute("INSERT INTO items_table(name) VALUES (?)", (category,) )
+            cur.execute("INSERT INTO categories_table(name) VALUES (?)", (category,) )
             con.commit()
             category_check = cur.lastrowid
 
         except sqlite3.Error as e:
             con.rollback()
             logger.error(f"エラーが発生したためロールバック: {e}")
+    else:
+        category_id = category_check[0]
 
     cur.execute("SELECT id FROM items_table WHERE name = ?", (name,))
     exist_check = cur.fetchone()
     if not exist_check:
         logger.debug(f"The item doesn't exist yet. ")
         try:
-            cur.execute("INSERT INTO items_table(name, category, image_name) VALUES (?, ?, ?)", (name, category, image_name) )
+            cur.execute("INSERT INTO items_table(name, category_id, image_name) VALUES (?, ?, ?)", (name, category_id, image_name) )
             con.commit()
 
         except sqlite3.Error as e:
@@ -113,6 +115,16 @@ def get_hash(image):
     hash = hashlib.sha256(image.encode()).hexdigest()
     return hash+".jpg"
 
+# category_id :int から対応する category :string を返す
+def get_category_name(category_id):
+    con = sqlite3.connect(sqlite3_file)
+    cur = con.cursor()
+    cur.execute("SELECT name FROM categories_table WHERE id = ?", (category_id,))
+    category = cur.fetchone()
+    cur.close()
+    con.close()
+    return category[0]
+
 # アイテムのリストを返すエンドポイント
 @app.get("/items")
 # アイテムのリストを取得
@@ -132,18 +144,24 @@ def get_items_from_sqlite3():
     con = sqlite3.connect(sqlite3_file)
     cur = con.cursor()
     cur.execute('SELECT * FROM items_table')
-    items_list = cur.fetchall()
+    items = cur.fetchall()
+    items_list = {"items":[]}
+    for i in range(len(items)):
+        category_id = items[i][2]
+        category = get_category_name(category_id)
+        item = {"name":items[i][1], "category":category, "image_name":items[i][3]}
+        items_list["items"].append(item)
     cur.close()
     con.close()
     return items_list
 
 
-# 特定のアイテムを取得するエンドポイント
+# 特定のアイテムの詳細を取得するエンドポイント
 @app.get("/items/{item_id}")
-# 特定のアイテムを取得する関数
+# 特定のアイテムの詳細を取得する関数
 def get_particular_item(item_id: int):
     #item = get_particular_item_from_json(item_id)     # items.json
-    item = get_particular_item_from_sqlite(item_id)     # mercari.sqlite3
+    item = get_particular_item_from_sqlite3(item_id)     # mercari.sqlite3
     return item
 
 # items.jsonに登録されたアイテムの詳細を取得
@@ -155,7 +173,7 @@ def get_particular_item_from_json(item_id: int):
     return items["items"][item_id-1]
 
 # mercari.sqlite3に登録されたアイテムの詳細を取得
-def get_particular_item_from_sqlite(item_id: int):
+def get_particular_item_from_sqlite3(item_id: int):
     con = sqlite3.connect(sqlite3_file)
     cur = con.cursor()
     cur.execute('SELECT * FROM items_table')
@@ -164,7 +182,8 @@ def get_particular_item_from_sqlite(item_id: int):
     if item_id > len(items):
         return {"message": "item not found"}
 
-    cur.execute("SELECT name FROM items_table WHERE id = ?", (id,))
+    category_id = items[item_id-1][2]
+    cur.execute("SELECT name FROM categories_table WHERE id = ?", (category_id,))
     category = cur.fetchone()
     item = {"name":items[item_id-1][1], "category":category[0], "image_name":items[item_id-1][3]}
 
@@ -175,10 +194,8 @@ def get_particular_item_from_sqlite(item_id: int):
 async def get_image(image_name):
     # Create image path
     image = images / image_name
-
     if not image_name.endswith(".jpg"):
         raise HTTPException(status_code=400, detail="Image path does not end with .jpg")
-
     if not image.exists():
         logger.debug(f"Image not found: {image}")
         image = images / "default.jpg"
@@ -196,6 +213,12 @@ def search_items(keyword: str):
     if not items:
         return logger.debug(f"The name's items not found: {keyword}")
     items = cur.fetchall()
+    for i in range(len(items)):
+        category_id = items[i][2]
+        category = get_category_name(category_id)
+        item_with_specified_keyword = {"name":items[i][1], "category":category, "image_name":items[i][3]}
+        items_list_with_specified_keyword["items"].append(item_with_specified_keyword)
+
     cur.close()
     con.close()
     return items_list_with_specified_keyword
